@@ -1,0 +1,74 @@
+/* Light Theme (Default) */
+:root {
+  /* Surface Colors */
+  --bg: #F7FAF9;
+  --panel: #FFFFFF;
+  --panel-2: #F3F5F4;
+
+  /* Border Colors */
+  --border: #E5EAE7;
+
+  /* Text Colors */
+  --text: #0B1F17;
+  --text-muted: #5A6B64;
+
+  /* Icon Colors */
+  --icon: #2E473C;
+
+  /* Input Colors */
+  --input-bg: #FFFFFF;
+  --input-text: #0B1F17;
+  --input-border: #D9E3DF;
+  --input-placeholder: #90A29A;
+
+  /* Interactive States */
+  --hover-bg: #F0F4F2;
+  --active-bg: #E8F0EC;
+  --focus-ring: var(--brand-500);
+}
+
+/* Dark Theme */
+[data-theme="dark"] {
+  /* Surface Colors */
+  --bg: #0F1412;
+  --panel: #121917;
+  --panel-2: #0C1713;
+
+  /* Border Colors */
+  --border: #233129;
+
+  /* Text Colors */
+  --text: #E6F1EC;
+  --text-muted: #9BB2A8;
+
+  /* Icon Colors */
+  --icon: #CFE5DB;
+
+  /* Input Colors */
+  --input-bg: #0E1512;
+  --input-text: #E6F1EC;
+  --input-border: #1F2A25;
+  --input-placeholder: #7C9288;
+
+  /* Interactive States */
+  --hover-bg: #1A211E;
+  --active-bg: #1F2A25;
+  --focus-ring: var(--brand-400);
+
+  /* Dark mode brand adjustments */
+  --brand-50: rgba(0, 177, 64, 0.05);
+  --brand-100: rgba(0, 177, 64, 0.1);
+  --brand-200: rgba(0, 177, 64, 0.2);
+  --brand-300: rgba(0, 177, 64, 0.3);
+  --brand-400: rgba(0, 177, 64, 0.4);
+  --brand-500: #00B140;
+  --brand-600: #33CC74;
+  --brand-700: #66D999;
+  --brand-800: #99E6BD;
+  --brand-900: #C2F0D6;
+
+  /* Adjust shadows for dark theme */
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.3);
+  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.4), 0 2px 4px -2px rgb(0 0 0 / 0.4);
+  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.5), 0 4px 6px -4px rgb(0 0 0 / 0.5);
+}
