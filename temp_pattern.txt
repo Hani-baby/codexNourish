@@ -1,0 +1,9 @@
+  static async getMealPlans(
+    _userId: string,
+    options: {
+      householdId?: string
+      limit?: number
+      includeNutrition?: boolean
+    } = {},
+  ): Promise<any[]> {
+    try {

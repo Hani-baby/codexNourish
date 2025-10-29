@@ -1,3 +1,39 @@
+/**
+ * Recipe Assigner Function
+ * 
+ * Purpose: Map every draft meal item to the single best compatible recipe in our database,
+ * or mark it as unmatched—fast, deterministic, and safe.
+ * 
+ * Core Principles:
+ * - NO OpenAI calls or tool calling
+ * - NO recipe generation
+ * - Purely deterministic matching of existing recipes
+ * - Returns unmatched items for planner to handle
+ * 
+ * Inputs:
+ * - draft_id (required)
+ * - household_id, user_id (scope & permissions)
+ * - Optional: start_index, max_items, time_budget_ms, min_confidence, strategy
+ * 
+ * Outputs:
+ * - assignments: [{ itemIndex, recipeId, confidence, source }]
+ * - unmatched_item_indexes: number[]
+ * - stats: totals, assignedBeforeRun, assignedThisRun, totalAssigned, remaining, elapsedMs, nextItemIndex
+ * - has_more: true if stopped early due to time budget or chunking
+ * 
+ * Match Quality Rules:
+ * ✅ Required dietary tags present
+ * ✅ No blocked dietary tags
+ * ✅ No blocked ingredients substrings
+ * ✅ Confidence ≥ threshold (default 0.8)
+ * 
+ * Features:
+ * - Idempotent: re-running doesn't duplicate or flip assignments
+ * - Time-budget aware: stops cleanly with has_more = true
+ * - Batch persistence: saves progress periodically
+ * - RLS-aware: only matches recipes visible to user (public or owner)
+ */
+
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.44.0'
 import { Pool } from 'https://deno.land/x/postgres@v0.17.2/mod.ts'
 
@@ -11,190 +47,8 @@ import {
   RecipeAssignmentResult,
   RecipeAssignmentRunStats,
   ResolvedRecipeAssignerRequest,
-  RecipeGenerationResponse,
-  SessionPreferences,
   ValidationError,
 } from '../_shared/types.ts'
-
-// Tool schemas for AI model
-const TOOL_SCHEMAS = [
-  {
-    type: "function",
-    function: {
-      name: "match_existing_recipe",
-      description: "Try to match this meal request to an existing recipe, respecting dietary requirements and exclusions.",
-      parameters: {
-        type: "object",
-        properties: {
-          title: { type: "string", description: "Meal title to match against recipes.title" },
-          meal_type: { type: "string", description: "e.g., breakfast, lunch, dinner, snack, dessert" },
-          cuisine: { type: ["string", "null"], description: "Preferred cuisine or null" },
-          required_dietary: {
-            type: "array",
-            items: { type: "string" },
-            description: "Tags that MUST be present (e.g., vegan, halal, gluten-free)"
-          },
-          blocked_tags: {
-            type: "array",
-            items: { type: "string" },
-            description: "Tags that MUST NOT be present (e.g., contains:peanut)"
-          },
-          blocked_ingredients: {
-            type: "array",
-            items: { type: "string" },
-            description: "Ingredient substrings to avoid (allergens/exclusions)"
-          },
-          user_id: { type: "string", description: "Owner/user scope for private recipes" }
-        },
-        required: ["title", "meal_type", "required_dietary", "blocked_tags", "blocked_ingredients", "user_id"],
-        additionalProperties: false
-      }
-    }
-  },
-  {
-    type: "function",
-    function: {
-      name: "generate_recipe",
-      description: "Generate a complete, family-friendly recipe that conforms to constraints and is ready to persist.",
-      parameters: {
-        type: "object",
-        properties: {
-          title: { type: "string", minLength: 3, maxLength: 160 },
-          slug: {
-            type: "string",
-            pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$",
-            minLength: 3,
-            maxLength: 180,
-            description: "Lowercase URL slug; uniqueness will be ensured server-side."
-          },
-          summary: { type: ["string","null"], maxLength: 1000 },
-          instructions: { type: ["string","null"] },
-          image_url: { type: ["string","null"], format: "uri" },
-          source_url: { type: ["string","null"], format: "uri" },
-          prep_min: { type: ["integer","null"], minimum: 0 },
-          cook_min: { type: ["integer","null"], minimum: 0 },
-          servings: { type: "number", exclusiveMinimum: 0 },
-          dietary_tags: {
-            type: "array",
-            items: { type: "string", minLength: 1 },
-            uniqueItems: true,
-            default: []
-          },
-          cuisine: { type: ["string","null"], maxLength: 120 },
-          is_public: { type: "boolean", default: false },
-          tags: {
-            type: "array",
-            items: { type: "string", minLength: 1, maxLength: 60 },
-            uniqueItems: true,
-            default: []
-          },
-          ingredients: {
-            type: "array",
-            minItems: 1,
-            items: {
-              type: "object",
-              additionalProperties: false,
-              required: ["ingredient_name"],
-              properties: {
-                ingredient_id: { type: ["string","null"], format: "uuid" },
-                ingredient_name: { type: "string", minLength: 1 },
-                quantity: { type: ["number","null"], exclusiveMinimum: 0 },
-                unit_id: { type: ["string","null"] },
-                unit_name: { type: ["string","null"], minLength: 1 },
-                preparation: { type: ["string","null"], maxLength: 200 },
-                notes: { type: ["string","null"], maxLength: 400 },
-                order_index: { type: "integer", minimum: 0, default: 0 },
-                metadata: { type: "object", additionalProperties: true },
-                normalized_qty_g: { type: ["number","null"] },
-                normalized_qty_ml: { type: ["number","null"] }
-              },
-              allOf: [
-                { anyOf: [ { required: ["ingredient_id"] }, { required: ["ingredient_name"] } ] }
-              ]
-            }
-          },
-          steps: {
-            type: "array",
-            minItems: 1,
-            items: {
-              type: "object",
-              additionalProperties: false,
-              required: ["step_number", "instruction"],
-              properties: {
-                step_number: { type: "integer", minimum: 1 },
-                instruction: { type: "string", minLength: 3 },
-                label: { type: ["string","null"] }
-              }
-            },
-            description: "Must be sequential 1..N; server will normalize."
-          },
-          nutrition: {
-            type: "object",
-            additionalProperties: false,
-            properties: {
-              calories_kcal: { type: ["integer","null"], minimum: 0 },
-              protein_g: { type: ["number","null"], minimum: 0 },
-              carbs_g: { type: ["number","null"], minimum: 0 },
-              fat_g: { type: ["number","null"], minimum: 0 },
-              fiber_g: { type: ["number","null"], minimum: 0 },
-              sugar_g: { type: ["number","null"], minimum: 0 },
-              sodium_mg: { type: ["integer","null"], minimum: 0 },
-              meta: { type: "object", additionalProperties: true, default: {} }
-            }
-          },
-          nutrition_per_serving: {
-            type: "object",
-            additionalProperties: false,
-            properties: {
-              calories_kcal: { type: ["integer","null"], minimum: 0 },
-              protein_g: { type: ["number","null"], minimum: 0 },
-              carbs_g: { type: ["number","null"], minimum: 0 },
-              fat_g: { type: ["number","null"], minimum: 0 },
-              fiber_g: { type: ["number","null"], minimum: 0 },
-              sugar_g: { type: ["number","null"], minimum: 0 },
-              sodium_mg: { type: ["integer","null"], minimum: 0 }
-            }
-          },
-          serving_notes: { type: "array", items: { type: "string" } },
-          allergens: { type: "array", items: { type: "string" } },
-          meta: { type: "object", additionalProperties: true }
-        },
-        required: ["title", "slug", "servings", "ingredients", "steps"],
-        additionalProperties: false
-      }
-    }
-  },
-  {
-    type: "function",
-    function: {
-      name: "revise_recipe_for_violations",
-      description: "Update a previously proposed recipe to fix validation errors or allergen conflicts.",
-      parameters: {
-        type: "object",
-        properties: {
-          original_title: { type: "string" },
-          violations: {
-            type: "array",
-            items: { type: "string" },
-            description: "Human-readable errors (e.g., 'contains peanut; user allergic')."
-          },
-          must_remove_ingredients: {
-            type: "array",
-            items: { type: "string" },
-            description: "Ingredients that must be removed or replaced."
-          },
-          constraints: {
-            type: "object",
-            additionalProperties: true,
-            description: "Re-asserted constraints (dietary patterns, time limits, budget, etc.)"
-          }
-        },
-        required: ["original_title", "violations"],
-        additionalProperties: false
-      }
-    }
-  }
-] as const
 
 const logger = createLogger('Recipe Assigner', '[ra]')
 const supabaseUrl = Deno.env.get('SUPABASE_URL')
@@ -209,212 +63,6 @@ if (!supabaseUrl || !serviceRoleKey) {
 const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey)
 const pool = databaseUrl ? new Pool(databaseUrl, 3, true) : null
 
-// Tool execution interfaces
-interface ToolCall {
-  id: string
-  type: 'function'
-  function: {
-    name: string
-    arguments: string
-  }
-}
-
-interface ToolResult {
-  tool_call_id: string
-  content: string
-}
-
-// Tool executors
-const executeMatchExistingRecipe = async (args: any): Promise<{ recipeId: string | null; confidence: number }> => {
-  const { title, meal_type, cuisine, required_dietary, blocked_tags, blocked_ingredients, user_id } = args
-  
-  try {
-    const candidates = await fetchCandidatesWithSql(
-      title,
-      meal_type,
-      cuisine,
-      required_dietary,
-      blocked_tags,
-      user_id,
-    )
-
-    if (candidates.length === 0) {
-      return { recipeId: null, confidence: 0 }
-    }
-
-    const best = pickBestCandidate(candidates, required_dietary, blocked_tags, blocked_ingredients)
-    if (!best) {
-      return { recipeId: null, confidence: 0 }
-    }
-
-    return {
-      recipeId: best.candidate.id,
-      confidence: best.confidence,
-    }
-  } catch (error) {
-    logger.warn('match_existing_recipe failed', { error: error instanceof Error ? error.message : String(error) })
-    return { recipeId: null, confidence: 0 }
-  }
-}
-
-const validateGeneratedRecipe = async (
-  recipeData: any,
-  preferences: HouseholdPreferenceAggregate,
-  userId: string,
-): Promise<{ violations: string[]; mustRemoveIngredients: string[] }> => {
-  const violations: string[] = []
-  const mustRemoveIngredients: string[] = []
-
-  // Check dietary requirements
-  const requiredDietary = preferences.members
-    .flatMap(member => member.dietary_patterns || [])
-    .filter(pattern => pattern.is_required)
-    .map(pattern => pattern.name.toLowerCase())
-
-  const recipeDietaryTags = (recipeData.dietary_tags || []).map((tag: string) => tag.toLowerCase())
-
-  for (const required of requiredDietary) {
-    if (!recipeDietaryTags.includes(required)) {
-      violations.push(`Missing required dietary tag: ${required}`)
-    }
-  }
-
-  // Check blocked ingredients/allergens
-  const blockedIngredients = preferences.members
-    .flatMap(member => member.allergies || [])
-    .map(allergy => allergy.name.toLowerCase())
-
-  const recipeIngredients = (recipeData.ingredients || []).map((ing: any) => 
-    ing.ingredient_name?.toLowerCase() || ''
-  )
-
-  for (const blocked of blockedIngredients) {
-    const found = recipeIngredients.some((ing: string) => 
-      ing.includes(blocked) || blocked.includes(ing)
-    )
-    if (found) {
-      violations.push(`Contains blocked ingredient: ${blocked}`)
-      mustRemoveIngredients.push(blocked)
-    }
-  }
-
-  // Check blocked dietary tags
-  const blockedTags = preferences.members
-    .flatMap(member => member.dietary_patterns || [])
-    .filter(pattern => pattern.is_blocked)
-    .map(pattern => pattern.name.toLowerCase())
-
-  for (const blocked of blockedTags) {
-    if (recipeDietaryTags.includes(blocked)) {
-      violations.push(`Contains blocked dietary tag: ${blocked}`)
-    }
-  }
-
-  // Basic validation
-  if (!recipeData.title || recipeData.title.length < 3) {
-    violations.push('Recipe title must be at least 3 characters')
-  }
-
-  if (!recipeData.servings || recipeData.servings <= 0) {
-    violations.push('Recipe must have positive servings count')
-  }
-
-  if (!recipeData.ingredients || recipeData.ingredients.length === 0) {
-    violations.push('Recipe must have at least one ingredient')
-  }
-
-  if (!recipeData.steps || recipeData.steps.length === 0) {
-    violations.push('Recipe must have at least one step')
-  }
-
-  return { violations, mustRemoveIngredients }
-}
-
-const executeGenerateRecipe = async (
-  args: any,
-  userId: string,
-  householdId: string,
-  draftId: string,
-  itemIndex: number,
-): Promise<string | null> => {
-  // Add required user_id and household_id to args
-  const enrichedArgs = {
-    ...args,
-    user_id: userId,
-    household_id: householdId,
-    draft_id: draftId,
-    draft_item_index: itemIndex,
-  }
-  
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), 30000) // 30 second timeout
-
-  let response: Response
-  try {
-    response = await fetch(`${supabaseUrl}/functions/v1/recipes-ai`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${serviceRoleKey}`,
-        apikey: serviceRoleKey,
-      },
-      body: JSON.stringify(enrichedArgs),
-      signal: controller.signal,
-    })
-  } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') {
-      logger.warn('recipes-ai generation request timed out; awaiting async callback', {
-        draft_id: draftId,
-        item_index: itemIndex,
-      })
-      return null
-    }
-    throw error
-  } finally {
-    clearTimeout(timeoutId)
-  }
-
-  if (response.status === 202) {
-    logger.info('recipes-ai accepted generation asynchronously', {
-      draft_id: draftId,
-      item_index: itemIndex,
-    })
-    return null
-  }
-
-  const body = (await response.json()) as Partial<RecipeGenerationResponse> & {
-    error?: string
-  }
-
-  if (!response.ok || !body || !body.success || !body.recipe_id) {
-    throw new Error(body?.error ?? 'recipes-ai failed to generate recipe')
-  }
-
-  return body.recipe_id
-}
-
-const executeReviseRecipeForViolations = async (
-  args: any,
-  userId: string,
-  householdId: string,
-  draftId: string,
-  itemIndex: number,
-): Promise<string | null> => {
-  // For now, we'll regenerate the recipe with the violations in mind
-  // This could be enhanced to actually modify the existing recipe
-  const { original_title, violations, must_remove_ingredients, constraints } = args
-  
-  // Create a new recipe generation request with the constraints and violations
-  const revisedArgs = {
-    ...constraints,
-    title: original_title,
-    violations_to_avoid: violations,
-    ingredients_to_avoid: must_remove_ingredients,
-  }
-
-  return executeGenerateRecipe(revisedArgs, userId, householdId, draftId, itemIndex)
-}
-
 interface RecipeCandidate {
   id: string
   title: string
@@ -428,6 +76,7 @@ interface RecipeCandidate {
 
 interface AssignmentRunResult {
   assignments: RecipeAssignmentResult[]
+  unmatched_item_indexes: number[]
   stats: RecipeAssignmentRunStats
   hasMore: boolean
 }
@@ -544,42 +193,72 @@ const parseRequest = (payload: unknown): RecipeAssignerRequest => {
   const householdId = optionalString(payload.household_id)
   const userId = optionalString(payload.user_id)
 
-  let draftItemIndex: number | undefined
-  const rawIndex = payload.draft_item_index
-  if (typeof rawIndex === 'number' && Number.isInteger(rawIndex) && rawIndex >= 0) {
-    draftItemIndex = rawIndex
-  } else if (typeof rawIndex === 'string' && rawIndex.trim()) {
-    const parsed = Number.parseInt(rawIndex.trim(), 10)
+  let startIndex: number | undefined
+  const rawStartIndex = payload.start_index
+  if (typeof rawStartIndex === 'number' && Number.isInteger(rawStartIndex) && rawStartIndex >= 0) {
+    startIndex = rawStartIndex
+  } else if (typeof rawStartIndex === 'string' && rawStartIndex.trim()) {
+    const parsed = Number.parseInt(rawStartIndex.trim(), 10)
     if (!Number.isNaN(parsed) && parsed >= 0) {
-      draftItemIndex = parsed
+      startIndex = parsed
     }
   }
 
-  const isCallback =
-    typeof payload.is_callback === 'boolean'
-      ? payload.is_callback
-      : typeof payload.is_callback === 'string'
-      ? payload.is_callback.toLowerCase() === 'true'
-      : false
+  let maxItems: number | undefined
+  const rawMaxItems = payload.max_items
+  if (typeof rawMaxItems === 'number' && Number.isInteger(rawMaxItems) && rawMaxItems > 0) {
+    maxItems = rawMaxItems
+  } else if (typeof rawMaxItems === 'string' && rawMaxItems.trim()) {
+    const parsed = Number.parseInt(rawMaxItems.trim(), 10)
+    if (!Number.isNaN(parsed) && parsed > 0) {
+      maxItems = parsed
+    }
+  }
 
-  const callbackRecipeId = optionalString(payload.callback_recipe_id)
+  let timeBudgetMs: number | undefined
+  const rawTimeBudget = payload.time_budget_ms
+  if (typeof rawTimeBudget === 'number' && rawTimeBudget > 0) {
+    timeBudgetMs = rawTimeBudget
+  } else if (typeof rawTimeBudget === 'string' && rawTimeBudget.trim()) {
+    const parsed = Number.parseInt(rawTimeBudget.trim(), 10)
+    if (!Number.isNaN(parsed) && parsed > 0) {
+      timeBudgetMs = parsed
+    }
+  }
+
+  let minConfidence: number | undefined
+  const rawMinConf = payload.min_confidence
+  if (typeof rawMinConf === 'number' && rawMinConf >= 0 && rawMinConf <= 1) {
+    minConfidence = rawMinConf
+  } else if (typeof rawMinConf === 'string' && rawMinConf.trim()) {
+    const parsed = Number.parseFloat(rawMinConf.trim())
+    if (!Number.isNaN(parsed) && parsed >= 0 && parsed <= 1) {
+      minConfidence = parsed
+    }
+  }
+
+  const strategy = optionalString(payload.strategy)
 
   const request: RecipeAssignerRequest = {
     draft_id: draftId,
     ...(householdId ? { household_id: householdId } : {}),
     ...(userId ? { user_id: userId } : {}),
-    ...(isCallback ? { is_callback: true } : {}),
-    ...(callbackRecipeId ? { callback_recipe_id: callbackRecipeId } : {}),
-    ...(draftItemIndex !== undefined ? { draft_item_index: draftItemIndex } : {}),
+    ...(startIndex !== undefined ? { start_index: startIndex } : {}),
+    ...(maxItems !== undefined ? { max_items: maxItems } : {}),
+    ...(timeBudgetMs !== undefined ? { time_budget_ms: timeBudgetMs } : {}),
+    ...(minConfidence !== undefined ? { min_confidence: minConfidence } : {}),
+    ...(strategy ? { strategy } : {}),
   }
   
   logger.info('Recipe assigner payload received', {
     draft_id: request.draft_id,
     household_id: request.household_id,
     user_id: request.user_id,
-    is_callback: request.is_callback ?? false,
-    callback_recipe_id: request.callback_recipe_id,
-    draft_item_index: request.draft_item_index,
+    start_index: startIndex,
+    max_items: maxItems,
+    time_budget_ms: timeBudgetMs,
+    min_confidence: minConfidence,
+    strategy,
   })
   
   return request
@@ -858,32 +537,41 @@ const pickBestCandidate = (
   requiredDietary: string[],
   blockedTags: string[],
   blockedIngredients: string[],
-): { candidate: RecipeCandidate; confidence: number } | null => {
+  minConfidence: number = 0.8,
+): { candidate: RecipeCandidate; confidence: number; rejectionReasons: string[] } | null => {
   const compatible: Array<{ candidate: RecipeCandidate; confidence: number }> = []
+  const rejectionReasons: string[] = []
 
   for (const candidate of candidates) {
     const dietaryTags = normalizeLowercase(candidate.dietary_tags ?? [])
     const ingredients = normalizeLowercase(candidate.ingredient_names ?? [])
 
-    if (
-      requiredDietary.length > 0 &&
-      !requiredDietary.every((tag) => dietaryTags.includes(tag))
-    ) {
+    // Check required dietary tags
+    if (requiredDietary.length > 0) {
+      const missingTags = requiredDietary.filter((tag) => !dietaryTags.includes(tag))
+      if (missingTags.length > 0) {
+        rejectionReasons.push(`Missing required tags: ${missingTags.join(', ')}`)
+      continue
+      }
+    }
+
+    // Check blocked dietary tags
+    const foundBlockedTags = blockedTags.filter((tag) => dietaryTags.includes(tag))
+    if (foundBlockedTags.length > 0) {
+      rejectionReasons.push(`Contains blocked tags: ${foundBlockedTags.join(', ')}`)
       continue
     }
 
-    if (blockedTags.some((tag) => dietaryTags.includes(tag))) {
+    // Check blocked ingredients
+    const foundBlockedIngredients = blockedIngredients.filter((token) =>
+      ingredients.some((ingredient) => ingredient.includes(token))
+    )
+    if (foundBlockedIngredients.length > 0) {
+      rejectionReasons.push(`Contains blocked ingredients: ${foundBlockedIngredients.join(', ')}`)
       continue
     }
 
-    if (
-      blockedIngredients.some((token) =>
-        ingredients.some((ingredient) => ingredient.includes(token)),
-      )
-    ) {
-      continue
-    }
-
+    // Calculate confidence score
     const confidence =
       candidate.similarity +
       (candidate.meal_type_match ? 0.08 : 0) +
@@ -893,19 +581,28 @@ const pickBestCandidate = (
   }
 
   if (compatible.length === 0) {
+    logger.info('No compatible candidates found', { rejection_reasons: rejectionReasons })
     return null
   }
 
+  // Sort by confidence (descending), then by updated_at (implicit in query order)
   compatible.sort((a, b) => b.confidence - a.confidence)
   const best = compatible[0]
 
-  if (best.confidence < 0.8) {
+  if (best.confidence < minConfidence) {
+    rejectionReasons.push(`Best confidence ${best.confidence.toFixed(3)} below threshold ${minConfidence}`)
+    logger.info('Best candidate below confidence threshold', {
+      best_confidence: best.confidence,
+      min_confidence: minConfidence,
+      rejection_reasons: rejectionReasons,
+    })
     return null
   }
 
   return {
     candidate: best.candidate,
     confidence: Math.min(1, Number(best.confidence.toFixed(3))),
+    rejectionReasons,
   }
 }
 
@@ -913,7 +610,8 @@ const findExistingRecipe = async (
   draftItem: MealPlanDraftItem,
   preferences: HouseholdPreferenceAggregate,
   userId: string,
-): Promise<{ recipeId: string; confidence: number } | null> => {
+  minConfidence: number = 0.8,
+): Promise<{ recipeId: string; confidence: number; rejectionReasons: string[] } | null> => {
   const requiredDietary = computeRequiredDietaryTags(preferences, draftItem)
   const { tagTokens, ingredientTokens } = computeBlockedTokens(preferences)
   const cuisine = inferCuisine(draftItem, preferences)
@@ -944,7 +642,7 @@ const findExistingRecipe = async (
     return null
   }
 
-  const best = pickBestCandidate(candidates, requiredDietary, tagTokens, ingredientTokens)
+  const best = pickBestCandidate(candidates, requiredDietary, tagTokens, ingredientTokens, minConfidence)
   if (!best) {
     return null
   }
@@ -952,384 +650,46 @@ const findExistingRecipe = async (
   return {
     recipeId: best.candidate.id,
     confidence: best.confidence,
+    rejectionReasons: best.rejectionReasons,
   }
 }
 
-const extractSessionPreferences = (draft: MealPlanDraftRecord): SessionPreferences => {
-  if (draft.user_context && isRecord(draft.user_context.session_preferences)) {
-    return draft.user_context.session_preferences as SessionPreferences
-  }
-  return {}
-}
-
-const buildDietaryTagPayload = (
-  draftItem: MealPlanDraftItem,
-  preferences: HouseholdPreferenceAggregate,
-): string[] => {
-  const preferenceTags = normalizeLowercase(preferences.combined.dietary_patterns ?? [])
-  const householdTags = normalizeLowercase(preferences.combined.allergies ?? []).map(
-    (value) => `avoid:${value}`,
-  )
-  const itemTags = Array.isArray(draftItem.tags)
-    ? normalizeLowercase(draftItem.tags.filter((tag) => tag.length <= 30))
-    : []
-  return normalizeLowercase([...preferenceTags, ...householdTags, ...itemTags])
-}
-
-// New AI integration with tools
-const callAiWithTools = async (
-  item: MealPlanDraftItem,
-  preferences: HouseholdPreferenceAggregate,
-  sessionPreferences: SessionPreferences,
-  assignerRequest: ResolvedRecipeAssignerRequest,
-  draftId: string,
-  itemIndex: number,
-): Promise<string | null> => {
-  const requiredDietary = computeRequiredDietaryTags(preferences, item)
-  const { tagTokens, ingredientTokens } = computeBlockedTokens(preferences)
-  const cuisine = inferCuisine(item, preferences)
-  const mealType = typeof item.meal_type === 'string' ? item.meal_type.toLowerCase() : ''
-  
-  const prompt = `You are a recipe assignment assistant. For this meal request, you must use the available tools to either match an existing recipe or generate a new one.
-
-Meal Request:
-- Title: ${item.title}
-- Description: ${item.description || 'No description'}
-- Meal Type: ${mealType}
-- Servings: ${typeof item.servings === 'number' && item.servings > 0 ? item.servings : 4}
-- Cuisine: ${cuisine || 'Any'}
-
-Household Constraints:
-- Required dietary tags: ${requiredDietary.join(', ') || 'None'}
-- Blocked tags: ${tagTokens.join(', ') || 'None'}
-- Blocked ingredients: ${ingredientTokens.join(', ') || 'None'}
-
-You MUST:
-1. First call match_existing_recipe to try finding an existing recipe
-2. If no match found (recipeId is null) or confidence is below 0.7, call generate_recipe
-3. If generate_recipe fails validation, call revise_recipe_for_violations
-
-Return the final recipe_id.`
-
-  const messages = [
-    {
-      role: 'system',
-      content: 'You are a helpful recipe assignment assistant. You must use the provided tools to match or generate recipes.'
-    },
-    {
-      role: 'user',
-      content: prompt
-    }
-  ]
-
-  // Add timeout with abort controller
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), 25000) // 25 second timeout
-
-  let response: Response
-  try {
-    response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${Deno.env.get('OPENAI_API_KEY')}`,
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o',
-        messages,
-        tools: TOOL_SCHEMAS,
-        tool_choice: 'required',
-        temperature: 0.1,
-      }),
-      signal: controller.signal,
-    })
-    clearTimeout(timeoutId)
-  } catch (error) {
-    clearTimeout(timeoutId)
-    if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error('OpenAI API call timed out after 25 seconds')
-    }
-    throw error
-  }
-
-  if (!response.ok) {
-    throw new Error(`OpenAI API error: ${response.status}`)
-  }
-
-  const aiResponse = await response.json()
-  const message = aiResponse.choices[0]?.message
-
-  if (!message || !message.tool_calls) {
-    throw new Error('AI did not make any tool calls')
-  }
-
-  // Execute tool calls
-  const toolResults: ToolResult[] = []
-  let finalRecipeId: string | null = null
-  let needsRevision = false
-  let revisionArgs: any = null
-  let pendingGenerationTriggered = false
-
-  for (const toolCall of message.tool_calls) {
-    const args = JSON.parse(toolCall.function.arguments)
-    let result: any
-
-    switch (toolCall.function.name) {
-      case 'match_existing_recipe':
-        result = await executeMatchExistingRecipe(args)
-        if (result.recipeId && result.confidence >= 0.7) {
-          finalRecipeId = result.recipeId
-        }
-        break
-      case 'generate_recipe':
-        // Validate the generated recipe
-        const validation = await validateGeneratedRecipe(args, preferences, assignerRequest.user_id)
-        if (validation.violations.length > 0) {
-          needsRevision = true
-          revisionArgs = {
-            original_title: args.title,
-            violations: validation.violations,
-            must_remove_ingredients: validation.mustRemoveIngredients,
-            constraints: {
-              required_dietary: computeRequiredDietaryTags(preferences, item),
-              blocked_tags: computeBlockedTokens(preferences).tagTokens,
-              blocked_ingredients: computeBlockedTokens(preferences).ingredientTokens,
-            }
-          }
-          result = { needs_revision: true, violations: validation.violations }
-        } else {
-          result = await executeGenerateRecipe(
-            args,
-            assignerRequest.user_id,
-            assignerRequest.household_id,
-            draftId,
-            itemIndex,
-          )
-          if (!result) {
-            pendingGenerationTriggered = true
-          }
-          finalRecipeId = result
-        }
-        break
-      case 'revise_recipe_for_violations':
-        result = await executeReviseRecipeForViolations(
-          args,
-          assignerRequest.user_id,
-          assignerRequest.household_id,
-          draftId,
-          itemIndex,
-        )
-        if (!result) {
-          pendingGenerationTriggered = true
-        }
-        finalRecipeId = result
-        break
-      default:
-        throw new Error(`Unknown tool: ${toolCall.function.name}`)
-    }
-
-    toolResults.push({
-      tool_call_id: toolCall.id,
-      content: JSON.stringify(result),
-    })
-  }
-
-  // If we need revision, make another AI call
-  if (needsRevision && revisionArgs) {
-    const revisionMessages = [
-      ...messages,
-      {
-        role: 'assistant',
-        content: null,
-        tool_calls: message.tool_calls
-      },
-      ...toolResults.map(tr => ({
-        role: 'tool',
-        content: tr.content,
-        tool_call_id: tr.tool_call_id
-      })),
-      {
-        role: 'user',
-        content: `The recipe generation failed validation. Please revise the recipe to fix these issues: ${revisionArgs.violations.join(', ')}. Use the revise_recipe_for_violations tool.`
-      }
-    ]
-
-    const revisionController = new AbortController()
-    const revisionTimeoutId = setTimeout(() => revisionController.abort(), 25000)
-    
-    let revisionResponse: Response
-    try {
-      revisionResponse = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${Deno.env.get('OPENAI_API_KEY')}`,
-        },
-        body: JSON.stringify({
-          model: 'gpt-4o',
-          messages: revisionMessages,
-          tools: TOOL_SCHEMAS,
-          tool_choice: 'required',
-          temperature: 0.1,
-        }),
-        signal: revisionController.signal,
-      })
-      clearTimeout(revisionTimeoutId)
-    } catch (error) {
-      clearTimeout(revisionTimeoutId)
-      if (error instanceof Error && error.name === 'AbortError') {
-        logger.warn('Revision API call timed out, skipping revision')
-        if (!finalRecipeId) {
-    if (pendingGenerationTriggered) {
-      return null
-    }
-    throw new Error('No recipe was successfully assigned')
-  }
-
-  return finalRecipeId
-      }
-      throw error
-    }
-
-    if (revisionResponse.ok) {
-      const revisionAiResponse = await revisionResponse.json()
-      const revisionMessage = revisionAiResponse.choices[0]?.message
-
-      if (revisionMessage && revisionMessage.tool_calls) {
-        for (const toolCall of revisionMessage.tool_calls) {
-          if (toolCall.function.name === 'revise_recipe_for_violations') {
-            const args = JSON.parse(toolCall.function.arguments)
-            finalRecipeId = await executeReviseRecipeForViolations(
-              args,
-              assignerRequest.user_id,
-              assignerRequest.household_id,
-              draftId,
-              itemIndex,
-            )
-            if (!finalRecipeId) {
-              pendingGenerationTriggered = true
-            }
-            break
-          }
-        }
-      }
-    }
-  }
-
-  if (!finalRecipeId) {
-    if (pendingGenerationTriggered) {
-      return null
-    }
-    throw new Error('No recipe was successfully assigned')
-  }
-
-  return finalRecipeId
-}
-
-// Legacy function for backward compatibility
-const callRecipesAi = async (
-  item: MealPlanDraftItem,
-  preferences: HouseholdPreferenceAggregate,
-  sessionPreferences: SessionPreferences,
-  assignerRequest: ResolvedRecipeAssignerRequest,
-  itemIndex: number,
-): Promise<string | null> => {
-  // Log the user_id we're about to send
-  logger.info('Calling recipes-ai with user_id', {
-    user_id: assignerRequest.user_id,
-    household_id: assignerRequest.household_id,
-    title: item.title,
-    meal_type: item.meal_type,
-  })
-
-  const requestPayload = {
-    title: item.title,
-    description: item.description,
-    meal_type: item.meal_type,
-    servings: typeof item.servings === 'number' && item.servings > 0 ? item.servings : 4,
-    dietary_tags: buildDietaryTagPayload(item, preferences),
-    cuisine: inferCuisine(item, preferences),
-    household_preferences: preferences,
-    session_preferences: sessionPreferences,
-    user_id: assignerRequest.user_id,
-    household_id: assignerRequest.household_id,
-    draft_id: assignerRequest.draft_id,
-    draft_item_index: itemIndex,
-  }
-
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), 30000) // 30 second timeout
-
-  let response: Response
-  try {
-    response = await fetch(`${supabaseUrl}/functions/v1/recipes-ai`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${serviceRoleKey}`,
-        apikey: serviceRoleKey,
-      },
-      body: JSON.stringify(requestPayload),
-      signal: controller.signal,
-    })
-  } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') {
-      logger.warn('recipes-ai fallback generation timed out; awaiting callback', {
-        draft_id: assignerRequest.draft_id,
-        item_index: itemIndex,
-      })
-      return null
-    }
-    throw error
-  } finally {
-    clearTimeout(timeoutId)
-  }
-
-  if (response.status === 202) {
-    logger.info('recipes-ai accepted fallback generation asynchronously', {
-      draft_id: assignerRequest.draft_id,
-      item_index: itemIndex,
-    })
-    return null
-  }
-
-  const body = (await response.json()) as Partial<RecipeGenerationResponse> & {
-    error?: string
-  }
-
-  if (!response.ok || !body || !body.success || !body.recipe_id) {
-    throw new Error(body?.error ?? 'recipes-ai failed to generate recipe')
-  }
-
-  return body.recipe_id
-}
 
 const assignRecipes = async (
   draft: MealPlanDraftRecord,
   preferences: HouseholdPreferenceAggregate,
   request: ResolvedRecipeAssignerRequest,
 ): Promise<AssignmentRunResult> => {
-  const sessionPreferences = extractSessionPreferences(draft)
   const startTime = Date.now()
-  const MAX_EXECUTION_TIME_MS = 50000 // 50 seconds max (leave 10s buffer for edge function)
+  
+  // Extract configuration from request
+  const startIndex = request.start_index ?? 0
+  const maxItems = request.max_items
+  const timeBudgetMs = request.time_budget_ms ?? 50000 // Default 50s with safety buffer
+  const minConfidence = request.min_confidence ?? 0.8
   const SAFETY_BUFFER_MS = 5000
   const SAVE_INTERVAL = 3
 
   const clonedItems = draft.items.map((item) => ({ ...item }))
   const assignments: RecipeAssignmentResult[] = []
+  const unmatchedItemIndexes: number[] = []
 
   const totalItems = clonedItems.length
   const assignedBeforeRun = clonedItems.filter((item) => Boolean(item.recipe_id)).length
 
   let totalAssigned = assignedBeforeRun
-  let pendingAssignments = 0
   let hasMore = false
   let dirty = false
+  let processedCount = 0
 
   logger.info('Starting recipe assignment run', {
     draft_id: draft.id,
     total_items: totalItems,
     already_assigned: assignedBeforeRun,
+    start_index: startIndex,
+    max_items: maxItems,
+    time_budget_ms: timeBudgetMs,
+    min_confidence: minConfidence,
   })
 
   const persistIfDirty = async (context: Record<string, unknown>) => {
@@ -1350,25 +710,38 @@ const assignRecipes = async (
     }
   }
 
-  for (let index = 0; index < clonedItems.length; index += 1) {
+  // Main assignment loop
+  const endIndex = maxItems ? Math.min(clonedItems.length, startIndex + maxItems) : clonedItems.length
+  
+  for (let index = startIndex; index < endIndex; index += 1) {
     const item = clonedItems[index]
-    const itemLogger = logger.child(`Item ${index + 1}/${clonedItems.length}`)
+    const itemLogger = logger.child(`Item ${index + 1}/${totalItems}`)
     const elapsedTime = Date.now() - startTime
-    const timeRemaining = MAX_EXECUTION_TIME_MS - elapsedTime
-    const generationStatus = getGenerationStatus(item)
+    const timeRemaining = timeBudgetMs - elapsedTime
 
-    if (generationStatus?.state === 'resolved' && item.recipe_id) {
-      const resolvedItem = markItemGenerationResolved(item, item.recipe_id, index)
-      if (resolvedItem !== item) {
-        clonedItems[index] = resolvedItem
-        dirty = true
-      }
+    // Check time budget
+    if (timeRemaining <= SAFETY_BUFFER_MS) {
+      hasMore = true
+      itemLogger.info('Stopping run due to time budget', {
+        elapsed_ms: elapsedTime,
+        time_remaining_ms: timeRemaining,
+        assigned_this_run: assignments.length,
+        unmatched_this_run: unmatchedItemIndexes.length,
+        items_remaining: endIndex - index,
+      })
+      break
+    }
+
+    // Skip items that already have recipe_id (idempotent)
+    if (item.recipe_id) {
+      itemLogger.info('Skipping already assigned item', { recipe_id: item.recipe_id })
       continue
     }
 
+    // Check for pending async generation status (skip if waiting for callback)
+    const generationStatus = getGenerationStatus(item)
     if (generationStatus?.state === 'pending') {
-      pendingAssignments += 1
-      itemLogger.info('Item awaiting async recipe generation callback', {
+      itemLogger.info('Skipping item awaiting async generation', {
         draft_id: draft.id,
         item_index: index,
         requested_at: generationStatus.requested_at,
@@ -1376,28 +749,7 @@ const assignRecipes = async (
       continue
     }
 
-    if (item.recipe_id) {
-      const cleaned = clearGenerationStatus(item)
-      if (cleaned !== item) {
-        clonedItems[index] = cleaned
-        dirty = true
-      }
-      itemLogger.info('Skipping already assigned item', { recipe_id: item.recipe_id })
-      continue
-    }
-
-    if (timeRemaining <= SAFETY_BUFFER_MS) {
-      hasMore = true
-      itemLogger.info('Stopping run before timeout', {
-        elapsed_ms: elapsedTime,
-        time_remaining_ms: timeRemaining,
-        assigned_this_run: assignments.length,
-        items_remaining: clonedItems.length - index,
-      })
-      break
-    }
-
-    itemLogger.info('Processing item', {
+    itemLogger.info('Processing item for recipe matching', {
       title: item.title,
       meal_type: item.meal_type,
       elapsed_ms: elapsedTime,
@@ -1405,114 +757,49 @@ const assignRecipes = async (
     })
 
     try {
-      itemLogger.info('Using AI tools for recipe assignment')
-      const recipeId = await callAiWithTools(
-        item,
-        preferences,
-        sessionPreferences,
-        request,
-        draft.id,
-        index,
-      )
-
-      if (recipeId) {
-        const updatedItem = markItemGenerationResolved(item, recipeId, index)
+      // Attempt to find existing recipe match
+      const existingMatch = await findExistingRecipe(item, preferences, request.user_id, minConfidence)
+      
+      if (existingMatch) {
+        // Assign recipe
+        const updatedItem = clearGenerationStatus({ ...item, recipe_id: existingMatch.recipeId })
         clonedItems[index] = updatedItem
         assignments.push({
           itemIndex: index,
-          recipeId,
-          confidence: 0.85,
-          source: 'ai_tools',
+          recipeId: existingMatch.recipeId,
+          confidence: existingMatch.confidence,
+          source: 'existing',
         })
         totalAssigned += 1
         dirty = true
-        itemLogger.info('Recipe assigned via AI tools', {
-          recipe_id: recipeId,
+        
+        itemLogger.info('Recipe matched and assigned', {
+          recipe_id: existingMatch.recipeId,
+          confidence: existingMatch.confidence,
           elapsed_ms: Date.now() - startTime,
         })
       } else {
-        pendingAssignments += 1
-        clonedItems[index] = markItemPendingGeneration(item, index, 'ai_tools')
-        dirty = true
-        itemLogger.info('Recipe generation deferred pending callback', {
-          draft_id: draft.id,
-          item_index: index,
-          source: 'ai_tools',
+        // No match found - add to unmatched
+        unmatchedItemIndexes.push(index)
+        itemLogger.info('No suitable recipe match found', {
+          title: item.title,
+          meal_type: item.meal_type,
+          min_confidence: minConfidence,
         })
-        await persistIfDirty({
-          draft_id: draft.id,
-          pending_item_index: index,
-          reason: 'pending_generation_ai_tools',
-        })
-        continue
       }
     } catch (error) {
-      itemLogger.warn('AI tools failed, attempting deterministic fallback', {
+      itemLogger.warn('Recipe matching failed for item', {
         error: error instanceof Error ? error.message : String(error),
         elapsed_ms: Date.now() - startTime,
       })
-
-      try {
-        const existing = await findExistingRecipe(item, preferences, request.user_id)
-        if (existing) {
-          const updatedItem = markItemGenerationResolved(item, existing.recipeId, index)
-          clonedItems[index] = updatedItem
-          assignments.push({
-            itemIndex: index,
-            recipeId: existing.recipeId,
-            confidence: existing.confidence,
-            source: 'existing',
-          })
-          totalAssigned += 1
-          dirty = true
-          itemLogger.info('Matched existing recipe (fallback)', {
-            recipe_id: existing.recipeId,
-            confidence: existing.confidence,
-            elapsed_ms: Date.now() - startTime,
-          })
-          continue
-        }
-      } catch (fallbackError) {
-        itemLogger.warn('Existing recipe lookup failed (fallback)', {
-          error: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
-        })
-      }
-
-      itemLogger.info('Falling back to recipes-ai')
-      const recipeId = await callRecipesAi(item, preferences, sessionPreferences, request, index)
-
-      if (recipeId) {
-        const updatedItem = markItemGenerationResolved(item, recipeId, index)
-        clonedItems[index] = updatedItem
-        assignments.push({
-          itemIndex: index,
-          recipeId,
-          confidence: 0.75,
-          source: 'generated',
-        })
-        totalAssigned += 1
-        dirty = true
-        itemLogger.info('Generated new recipe (fallback)', {
-          recipe_id: recipeId,
-          elapsed_ms: Date.now() - startTime,
-        })
-      } else {
-        pendingAssignments += 1
-        clonedItems[index] = markItemPendingGeneration(item, index, 'recipes_ai')
-        dirty = true
-        itemLogger.info('recipes-ai accepted generation asynchronously', {
-          draft_id: draft.id,
-          item_index: index,
-        })
-        await persistIfDirty({
-          draft_id: draft.id,
-          pending_item_index: index,
-          reason: 'pending_generation_recipes_ai',
-        })
-      }
+      // On error, add to unmatched rather than crashing
+      unmatchedItemIndexes.push(index)
     }
 
-    if (assignments.length > 0 && assignments.length % SAVE_INTERVAL === 0) {
+    processedCount += 1
+
+    // Periodic persistence
+    if (dirty && (processedCount % SAVE_INTERVAL === 0)) {
       await persistIfDirty({
         draft_id: draft.id,
         assignments_saved: assignments.length,
@@ -1521,10 +808,12 @@ const assignRecipes = async (
     }
   }
 
+  // Final persistence
   if (dirty) {
     await persistIfDirty({
       draft_id: draft.id,
       assignments_saved: assignments.length,
+      unmatched_count: unmatchedItemIndexes.length,
       elapsed_ms: Date.now() - startTime,
       reason: hasMore ? 'finalize_partial' : 'finalize_run',
     })
@@ -1532,27 +821,36 @@ const assignRecipes = async (
 
   const elapsedMs = Date.now() - startTime
   const remaining = totalItems - totalAssigned
-  const nextItemIndex = clonedItems.findIndex((entry) => {
-    if (entry.recipe_id) {
-      return false
+  
+  // Find next item index for resumption
+  let nextItemIndex: number | null = null
+  if (hasMore || endIndex < clonedItems.length) {
+    for (let i = endIndex; i < clonedItems.length; i++) {
+      if (!clonedItems[i].recipe_id) {
+        const status = getGenerationStatus(clonedItems[i])
+        if (status?.state !== 'pending') {
+          nextItemIndex = i
+          break
+        }
+      }
     }
-    const status = getGenerationStatus(entry)
-    return status?.state !== 'pending'
-  })
+  }
 
   logger.info('Recipe assignment run complete', {
     draft_id: draft.id,
     elapsed_ms: elapsedMs,
     assigned_this_run: assignments.length,
     total_assigned: totalAssigned,
-    pending_assignments: pendingAssignments,
+    unmatched_this_run: unmatchedItemIndexes.length,
     remaining,
-    has_more: hasMore || pendingAssignments > 0,
+    has_more: hasMore || nextItemIndex !== null,
+    next_item_index: nextItemIndex,
   })
 
   return {
     assignments,
-    hasMore: hasMore || pendingAssignments > 0,
+    unmatched_item_indexes: unmatchedItemIndexes,
+    hasMore: hasMore || nextItemIndex !== null,
     stats: {
       totalItems,
       assignedBeforeRun,
@@ -1560,107 +858,10 @@ const assignRecipes = async (
       totalAssigned,
       remaining,
       elapsedMs,
-      nextItemIndex: nextItemIndex === -1 ? null : nextItemIndex,
-      pendingAssignments,
+      nextItemIndex,
+      pendingAssignments: 0, // No async generation anymore
     },
   }
-}
-const handleGenerationCallback = async (
-  draft: MealPlanDraftRecord,
-  request: RecipeAssignerRequest,
-): Promise<Response> => {
-  const recipeId = request.callback_recipe_id
-  if (!recipeId) {
-    logger.warn('Callback missing recipe identifier', {
-      draft_id: draft.id,
-      request_payload: request,
-    })
-    return createErrorResponse('callback_recipe_id is required for callbacks', 400)
-  }
-
-  let targetIndex =
-    typeof request.draft_item_index === 'number' ? request.draft_item_index : undefined
-
-  if (targetIndex === undefined || targetIndex < 0 || targetIndex >= draft.items.length) {
-    targetIndex = draft.items.findIndex((item) => {
-      const status = getGenerationStatus(item)
-      return status?.state === 'pending' && (!status.item_index || status.item_index >= 0)
-    })
-  }
-
-  if (targetIndex === -1) {
-    const alreadyAssigned = draft.items.some((item) => item.recipe_id === recipeId)
-    if (alreadyAssigned) {
-      logger.info('Callback ignored - recipe already assigned elsewhere', {
-        draft_id: draft.id,
-        recipe_id: recipeId,
-      })
-      return createJsonResponse({ success: true, message: 'Recipe already assigned' }, 200)
-    }
-
-    logger.warn('Callback without matching draft item', {
-      draft_id: draft.id,
-      recipe_id: recipeId,
-      provided_index: request.draft_item_index,
-    })
-    return createJsonResponse(
-      {
-        success: false,
-        message: 'No matching draft item found for callback',
-      },
-      202,
-    )
-  }
-
-  const targetItem = draft.items[targetIndex]
-
-  if (targetItem.recipe_id === recipeId) {
-    logger.info('Callback ignored - item already assigned to recipe', {
-      draft_id: draft.id,
-      recipe_id: recipeId,
-      item_index: targetIndex,
-    })
-    return createJsonResponse({ success: true, message: 'Recipe already assigned' }, 200)
-  }
-
-  if (targetItem.recipe_id && targetItem.recipe_id !== recipeId) {
-    logger.info('Callback received but item already bound to other recipe', {
-      draft_id: draft.id,
-      existing_recipe_id: targetItem.recipe_id,
-      received_recipe_id: recipeId,
-      item_index: targetIndex,
-    })
-    return createJsonResponse(
-      {
-        success: true,
-        message: 'Item already assigned to a different recipe',
-      },
-      200,
-    )
-  }
-
-  const updatedItems = [...draft.items]
-  const updatedItem = markItemGenerationResolved(targetItem, recipeId, targetIndex)
-  updatedItems[targetIndex] = updatedItem
-
-  await persistAssignments(draft.id, updatedItems)
-  draft.items = updatedItems
-
-  logger.info('Applied recipe generation callback', {
-    draft_id: draft.id,
-    recipe_id: recipeId,
-    item_index: targetIndex,
-  })
-
-  return createJsonResponse(
-    {
-      success: true,
-      draft_id: draft.id,
-      recipe_id: recipeId,
-      item_index: targetIndex,
-    },
-    200,
-  )
 }
 const persistAssignments = async (draftId: string, items: MealPlanDraftItem[]) => {
   const { error } = await supabaseAdmin
@@ -1699,11 +900,6 @@ Deno.serve(async (req: Request) => {
   try {
     const request = parseRequest(payload)
     const draft = await loadDraft(request.draft_id)
-
-    if (request.is_callback) {
-      return await handleGenerationCallback(draft, request)
-    }
-
     const resolvedRequest = resolveRequest(request, draft)
 
     const householdPreferences = await fetchHouseholdPreferences(
@@ -1721,13 +917,12 @@ Deno.serve(async (req: Request) => {
       draft_id: draft.id,
       has_more: runResult.hasMore,
       assigned_this_run: runResult.stats.assignedThisRun,
+      unmatched_this_run: runResult.unmatched_item_indexes.length,
       total_assigned: runResult.stats.totalAssigned,
       remaining: runResult.stats.remaining,
-      pending_assignments: runResult.stats.pendingAssignments ?? 0,
     })
 
     const statusCode = runResult.hasMore ? 202 : 200
-    const pendingCount = runResult.stats.pendingAssignments ?? 0
 
     return createJsonResponse(
       {
@@ -1735,15 +930,12 @@ Deno.serve(async (req: Request) => {
         draft_id: draft.id,
         status: runResult.hasMore ? 'partial' : 'completed',
         assignments: runResult.assignments,
+        unmatched_item_indexes: runResult.unmatched_item_indexes,
         stats: runResult.stats,
         has_more: runResult.hasMore,
-        pending_assignments: pendingCount,
         progress_ratio:
           runResult.stats.totalItems > 0
-            ? Math.min(
-                1,
-                (runResult.stats.totalAssigned + pendingCount) / runResult.stats.totalItems,
-              )
+            ? runResult.stats.totalAssigned / runResult.stats.totalItems
             : 1,
         resume_hint: runResult.hasMore
           ? {

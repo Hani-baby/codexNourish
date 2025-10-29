@@ -150,9 +150,11 @@ export interface RecipeAssignerRequest {
   draft_id: string
   household_id?: string
   user_id?: string
-  is_callback?: boolean
-  callback_recipe_id?: string
-  draft_item_index?: number
+  start_index?: number
+  max_items?: number
+  time_budget_ms?: number
+  min_confidence?: number
+  strategy?: string
 }
 
 export type ResolvedRecipeAssignerRequest = RecipeAssignerRequest & {
