@@ -194,12 +194,10 @@ const callOpenAiDraftGenerator = async (
     },
     body: JSON.stringify({
       model: openAiModel,
+      instructions: SYSTEM_PROMPT,
       input: [
         {
-          role: "system",
-          content: [{ type: "input_text", text: SYSTEM_PROMPT }],
-        },
-        {
+          type: "message",
           role: "user",
           content: [
             {
@@ -215,8 +213,7 @@ const callOpenAiDraftGenerator = async (
       text: {
         format: {
           type: "json_schema",
-          name: "meal_plan_draft",
-          strict: true,
+          name: MEAL_PLAN_DRAFT_RESPONSE_SCHEMA.json_schema.name,
           schema: MEAL_PLAN_DRAFT_RESPONSE_SCHEMA.json_schema.schema,
         },
       },
@@ -234,39 +231,37 @@ const callOpenAiDraftGenerator = async (
     throw new Error(message);
   }
 
-  // Prefer parsed output if the API provided it, else fall back to text and parse.
-  // Shape note: Responses API returns `output` (array). Each item has `content` parts.
-  // For structured outputs, many SDKs expose `output_parsed`, but raw HTTP usually gives `output_text`.
+  // Parse the structured output from Responses API
+  // The API returns an `output` array with message items containing content parts
   let aiJson: AiDraftPayload | null = null;
 
-  if (
-    typeof responseBody.output_parsed === "object" &&
-    responseBody.output_parsed
-  ) {
-    aiJson = responseBody.output_parsed as AiDraftPayload;
-  } else if (typeof responseBody.output_text === "string") {
-    try {
-      aiJson = JSON.parse(responseBody.output_text) as AiDraftPayload;
-    } catch {
-      // fall through to deeper scan
-    }
-  }
+  // Check if there's a direct output array
+  const output = Array.isArray(responseBody.output)
+    ? responseBody.output
+    : [];
 
-  if (!aiJson) {
-    const output = Array.isArray(responseBody.output)
-      ? responseBody.output
-      : [];
-    for (const block of output) {
-      if (Array.isArray(block.content)) {
-        for (const part of block.content) {
-          // The Responses API uses 'output_text' for assistant text parts.
-          if (part.type === "output_text" && typeof part.text === "string") {
-            try {
-              aiJson = JSON.parse(part.text) as AiDraftPayload;
-              break;
-            } catch {
-              /* ignore parse errors */
-            }
+  // Look for message items with output_text content
+  for (const item of output) {
+    if (item.type === "message" && Array.isArray(item.content)) {
+      for (const part of item.content) {
+        if (part.type === "output_text" && typeof part.text === "string") {
+          try {
+            aiJson = JSON.parse(part.text) as AiDraftPayload;
+            logger.info(
+              "Parsed meal plan from output_text",
+              { item_count: aiJson?.items?.length ?? 0 },
+              "✅"
+            );
+            break;
+          } catch (parseError) {
+            logger.error(
+              "Failed to parse output_text as JSON",
+              { 
+                error: parseError instanceof Error ? parseError.message : String(parseError),
+                text_preview: part.text.slice(0, 200)
+              },
+              "⚠️"
+            );
           }
         }
       }

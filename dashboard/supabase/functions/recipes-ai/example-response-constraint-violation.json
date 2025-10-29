@@ -1,0 +1,12 @@
+{
+  "success": false,
+  "error": "Recipe violates constraints",
+  "error_type": "CONSTRAINT_VIOLATION",
+  "violations": [
+    "Blocked ingredient detected: peanuts (found: peanut butter)",
+    "Required dietary tag missing: high-protein",
+    "Cook time 45min exceeds maximum 30min"
+  ]
+}
+
+

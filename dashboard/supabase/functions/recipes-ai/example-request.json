@@ -1,0 +1,45 @@
+{
+  "title": "Mediterranean Chickpea Bowl",
+  "meal_type": "lunch",
+  "servings": 4,
+  "constraints": {
+    "required_dietary": ["vegetarian", "high-protein"],
+    "blocked_ingredients": ["peanuts", "shellfish"],
+    "blocked_tags": ["spicy", "fried"],
+    "max_prep_min": 20,
+    "max_cook_min": 30
+  },
+  "cuisine": "mediterranean",
+  "household_preferences": {
+    "combined": {
+      "cuisines": ["mediterranean", "italian"],
+      "dislikes": ["cilantro"],
+      "dietary_patterns": ["vegetarian"],
+      "excluded_ingredients": ["peanuts"],
+      "allergies": ["shellfish"],
+      "convenience_level": "moderate",
+      "cooking_time": "30-45min",
+      "leftovers_policy": "yes"
+    },
+    "members": [
+      {
+        "user_id": "user-123",
+        "name": "Alice",
+        "dietary_patterns": ["vegetarian"],
+        "allergies": ["shellfish"]
+      }
+    ]
+  },
+  "session_preferences": {
+    "preferred_cuisines": ["mediterranean"],
+    "avoid_ingredients": [],
+    "max_cooking_time": 45
+  },
+  "user_id": "user-123",
+  "household_id": "household-456",
+  "idempotency_key": "job-789-item-0-retry-0",
+  "job_id": "job-789",
+  "dry_run": false
+}
+
+

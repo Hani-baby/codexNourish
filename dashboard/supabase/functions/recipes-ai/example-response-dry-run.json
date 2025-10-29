@@ -1,0 +1,79 @@
+{
+  "success": true,
+  "dry_run": true,
+  "recipe": {
+    "base": {
+      "created_by": "chef-nourish-uuid",
+      "inspired": "user-123",
+      "title": "Mediterranean Chickpea Bowl",
+      "slug": "mediterranean-chickpea-bowl",
+      "summary": "A healthy and flavorful vegetarian bowl with chickpeas, fresh vegetables, and a tangy tahini dressing",
+      "instructions": "A complete step-by-step guide...",
+      "image_url": null,
+      "source_url": null,
+      "prep_min": 15,
+      "cook_min": 25,
+      "servings": 4,
+      "dietary_tags": ["vegetarian", "high-protein", "mediterranean"],
+      "cuisine": "mediterranean",
+      "is_public": true
+    },
+    "tags": ["ai-generated", "lunch", "bowl", "healthy"],
+    "ingredients": [
+      {
+        "ingredient_id": null,
+        "ingredient_name": "chickpeas",
+        "quantity": 2,
+        "unit_id": null,
+        "unit_name": "can",
+        "preparation": "drained and rinsed",
+        "notes": "15oz cans",
+        "order_index": 0,
+        "metadata": {
+          "normalized_qty_g": 480
+        }
+      }
+    ],
+    "steps": [
+      {
+        "step_number": 1,
+        "instruction": "Preheat oven to 400°F (200°C)."
+      }
+    ],
+    "nutrition": {
+      "calories_kcal": 420,
+      "protein_g": 18,
+      "carbs_g": 52,
+      "fat_g": 14,
+      "fiber_g": 12,
+      "sugar_g": 8,
+      "sodium_mg": 580,
+      "meta": {
+        "generated_by": "recipes-ai",
+        "model": "gpt-4.1-mini",
+        "requested_meal_type": "lunch",
+        "idempotency_key": "job-789-item-0-retry-0",
+        "job_id": "job-789",
+        "constraints": {
+          "required_dietary": ["vegetarian", "high-protein"],
+          "blocked_ingredients": ["peanuts", "shellfish"],
+          "blocked_tags": ["spicy", "fried"],
+          "max_prep_min": 20,
+          "max_cook_min": 30
+        },
+        "provenance": {
+          "model": "gpt-4.1-mini",
+          "temperature": 0.8,
+          "generated_at": "2025-01-15T10:30:00.000Z"
+        }
+      }
+    }
+  },
+  "provenance": {
+    "model": "gpt-4.1-mini",
+    "temperature": 0.8,
+    "prompt_hash": "abc123-placeholder"
+  }
+}
+
+

@@ -48,7 +48,7 @@ const getChefNourishUserId = async (): Promise<string> => {
 
   // Read from Supabase secret
   const chefNourishId = Deno.env.get("CHEFNOURISH");
-  
+
   if (!chefNourishId || chefNourishId.trim().length === 0) {
     logger.error('CHEFNOURISH secret is not configured');
     throw new Error('CHEFNOURISH secret must be set in Supabase project settings');
@@ -63,7 +63,7 @@ const getChefNourishUserId = async (): Promise<string> => {
 const recipeSchemaFormat = (() => {
   const type =
     typeof RECIPE_GENERATION_SCHEMA.type === "string" &&
-    RECIPE_GENERATION_SCHEMA.type.trim()
+      RECIPE_GENERATION_SCHEMA.type.trim()
       ? RECIPE_GENERATION_SCHEMA.type.trim()
       : "json_schema";
   const jsonSchema = RECIPE_GENERATION_SCHEMA.json_schema ?? {};
@@ -107,17 +107,28 @@ function sanitizeSchema(node: any): any {
   return node;
 }
 
+interface RecipeConstraints {
+  required_dietary: string[];
+  blocked_ingredients: string[];
+  blocked_tags: string[];
+  max_prep_min?: number;
+  max_cook_min?: number;
+  budget_per_serving_cents?: number;
+}
+
 interface RecipeAiRequestBody {
   title: string;
-  description?: string;
-  meal_type?: string;
+  meal_type: string;
   servings: number;
-  dietary_tags?: string[];
+  constraints: RecipeConstraints;
   cuisine?: string | null;
   household_preferences?: HouseholdPreferenceAggregate;
   session_preferences?: SessionPreferences;
-  user_id: string;
+  user_id?: string | null;
   household_id: string;
+  idempotency_key: string;
+  job_id?: string;
+  dry_run?: boolean;
 }
 
 interface AiIngredient {
@@ -226,17 +237,17 @@ interface RecipeGenerationContext {
 
 interface NormalizedRecipeRequest {
   title: string;
-  description: string;
   meal_type: string;
   servings: number;
-  dietary_tags: string[];
+  constraints: RecipeConstraints;
   cuisine: string | null;
   user_id: string | null;
   household_id: string;
   household_preferences: HouseholdPreferenceAggregate;
   session_preferences: SessionPreferences;
-  draft_id?: string | null;
-  draft_item_index?: number | null;
+  idempotency_key: string;
+  job_id: string | null;
+  dry_run: boolean;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -341,59 +352,45 @@ const parseRequest = async (
   }
 
   const title = ensureString(body, "title");
-  const description =
-    typeof body.description === "string" ? body.description.trim() : "";
-  const mealType =
-    ensureString(body, "meal_type", { fallback: "unspecified" }) ||
-    "unspecified";
+  const mealType = ensureString(body, "meal_type", { fallback: "unspecified" }) || "unspecified";
   const servings = ensurePositiveNumber(body, "servings");
-  const dietaryTags = normalizeLowercaseArray(
-    ensureStringArray(body.dietary_tags)
-  );
+  const idempotencyKey = ensureString(body, "idempotency_key");
+
+  // Parse constraints
+  const constraintsRaw = body.constraints;
+  if (!isRecord(constraintsRaw)) {
+    throw new ValidationError("constraints must be an object");
+  }
+  const constraints: RecipeConstraints = {
+    required_dietary: normalizeLowercaseArray(ensureStringArray(constraintsRaw.required_dietary)),
+    blocked_ingredients: normalizeLowercaseArray(ensureStringArray(constraintsRaw.blocked_ingredients)),
+    blocked_tags: normalizeLowercaseArray(ensureStringArray(constraintsRaw.blocked_tags)),
+    max_prep_min: typeof constraintsRaw.max_prep_min === "number" && constraintsRaw.max_prep_min > 0 ? constraintsRaw.max_prep_min : undefined,
+    max_cook_min: typeof constraintsRaw.max_cook_min === "number" && constraintsRaw.max_cook_min > 0 ? constraintsRaw.max_cook_min : undefined,
+    budget_per_serving_cents: typeof constraintsRaw.budget_per_serving_cents === "number" && constraintsRaw.budget_per_serving_cents > 0 ? constraintsRaw.budget_per_serving_cents : undefined,
+  };
+
   const cuisineRaw =
     typeof body.cuisine === "string" && body.cuisine.trim().length > 0
       ? body.cuisine.trim()
       : null;
-  const userIdRaw = ensureString(body, "user_id");
-  
-  // Log what we received
+
+  const userIdRaw = typeof body.user_id === "string" ? body.user_id.trim() : null;
+  const userId = userIdRaw && userIdRaw !== "0" && userIdRaw.length > 0 ? userIdRaw : null;
+
+  const householdId = ensureString(body, "household_id");
+  const jobId = typeof body.job_id === "string" && body.job_id.trim().length > 0 ? body.job_id.trim() : null;
+  const dryRun = typeof body.dry_run === "boolean" ? body.dry_run : false;
+
   logger.info("Received recipe generation request", {
     title,
     meal_type: mealType,
-    user_id_received: userIdRaw,
-    household_id: body.household_id,
+    user_id: userId,
+    household_id: householdId,
+    idempotency_key: idempotencyKey,
+    job_id: jobId,
+    dry_run: dryRun,
   });
-  
-  // Treat "0" or invalid UUID as null for the inspired field
-  if (userIdRaw === "0" || userIdRaw.trim().length === 0) {
-    logger.warn("Received invalid user_id, treating as null", {
-      received_value: userIdRaw,
-      household_id: body.household_id,
-    });
-  }
-  const userId = userIdRaw === "0" || userIdRaw.trim().length === 0 ? null : userIdRaw;
-  const householdId = ensureString(body, "household_id");
-  const draftId =
-    typeof body.draft_id === "string" && body.draft_id.trim().length > 0
-      ? body.draft_id.trim()
-      : null;
-  let draftItemIndex: number | null = null;
-  const rawDraftIndex = (body as Record<string, unknown>).draft_item_index;
-  if (
-    typeof rawDraftIndex === "number" &&
-    Number.isInteger(rawDraftIndex) &&
-    rawDraftIndex >= 0
-  ) {
-    draftItemIndex = rawDraftIndex;
-  } else if (
-    typeof rawDraftIndex === "string" &&
-    rawDraftIndex.trim().length > 0
-  ) {
-    const parsed = Number.parseInt(rawDraftIndex.trim(), 10);
-    if (!Number.isNaN(parsed) && parsed >= 0) {
-      draftItemIndex = parsed;
-    }
-  }
 
   let sessionPreferences: SessionPreferences = {};
   if (isRecord(body.session_preferences)) {
@@ -405,7 +402,9 @@ const parseRequest = async (
     householdPreferences = body.household_preferences;
   }
 
+  // Only fetch if not provided (Planner should pass them)
   if (!householdPreferences) {
+    logger.info("Household preferences not provided, fetching", { household_id: householdId });
     householdPreferences = await fetchHouseholdPreferences(
       supabaseAdmin,
       householdId
@@ -414,68 +413,135 @@ const parseRequest = async (
 
   return {
     title,
-    description,
     meal_type: mealType,
     servings,
-    dietary_tags: dietaryTags,
+    constraints,
     cuisine: cuisineRaw,
     user_id: userId,
     household_id: householdId,
     household_preferences: householdPreferences,
     session_preferences: sessionPreferences,
-    draft_id: draftId,
-    draft_item_index: draftItemIndex,
+    idempotency_key: idempotencyKey,
+    job_id: jobId,
+    dry_run: dryRun,
   };
 };
 
-const callbackAssigner = async (
-  recipeId: string,
-  draftId: string,
-  draftItemIndex: number | null,
-): Promise<void> => {
-  if (!draftId) {
-    return
-  }
+// Removed: callbackAssigner - recipes-ai no longer calls back to assigner
 
-  try {
-    logger.info('Calling back to recipe-assigner', {
-      recipe_id: recipeId,
-      draft_id: draftId,
-      draft_item_index: draftItemIndex,
-    })
+// --- Error Taxonomy ---
+type RecipeErrorType =
+  | "SCHEMA_VALIDATION_ERROR"
+  | "CONSTRAINT_VIOLATION"
+  | "IDEMPOTENT_DUPLICATE"
+  | "PROVIDER_TIMEOUT"
+  | "PROVIDER_ERROR"
+  | "DB_PERSIST_ERROR"
+  | "VALIDATION_ERROR";
 
-    const response = await fetch(`${supabaseUrl}/functions/v1/recipe-assigner`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${serviceRoleKey}`,
-        apikey: serviceRoleKey,
-      },
-      body: JSON.stringify({
-        draft_id: draftId,
-        callback_recipe_id: recipeId,
-        is_callback: true,
-        draft_item_index: draftItemIndex,
-      }),
-    })
-
-    if (!response.ok) {
-      logger.warn('Callback to recipe-assigner failed', {
-        status: response.status,
-        draft_id: draftId,
-      })
-    } else {
-      logger.info('Successfully called back to recipe-assigner', {
-        draft_id: draftId,
-      })
-    }
-  } catch (error) {
-    logger.warn('Failed to callback recipe-assigner', {
-      error: error instanceof Error ? error.message : String(error),
-      draft_id: draftId,
-    })
-  }
+interface RecipeError {
+  success: false;
+  error: string;
+  error_type: RecipeErrorType;
+  violations?: string[];
 }
+
+// --- Idempotency Check ---
+const checkIdempotency = async (
+  idempotencyKey: string,
+  householdId: string
+): Promise<{ recipe_id: string; slug: string; title: string } | null> => {
+  const { data, error } = await supabaseAdmin
+    .from("recipes")
+    .select("id, slug, title")
+    .eq("created_by", await getChefNourishUserId())
+    .contains("dietary_tags", [])  // Just to ensure proper query structure
+    .limit(100);  // Get recent recipes to scan
+
+  if (error) {
+    logger.warn("Failed to check idempotency", { error: error.message });
+    return null;
+  }
+
+  // Check metadata for idempotency_key match
+  // Since we can't directly query JSONB, we'd need to add an index or column
+  // For now, we'll return null and rely on natural deduplication
+  // TODO: Add idempotency_key column to recipes table for efficient lookup
+  return null;
+};
+
+// --- Constraint Validation ---
+interface ConstraintValidationResult {
+  valid: boolean;
+  violations: string[];
+}
+
+const validateConstraints = (
+  recipe: AiRecipePayload["recipe"],
+  constraints: RecipeConstraints
+): ConstraintValidationResult => {
+  const violations: string[] = [];
+
+  // Check blocked ingredients
+  if (constraints.blocked_ingredients.length > 0 && recipe.ingredients) {
+    const ingredients = recipe.ingredients.map(ing =>
+      (ing.ingredient_name ?? "").toLowerCase()
+    );
+    for (const blocked of constraints.blocked_ingredients) {
+      const blockedLower = blocked.toLowerCase();
+      for (const ingredient of ingredients) {
+        if (ingredient.includes(blockedLower) || blockedLower.includes(ingredient)) {
+          violations.push(`Blocked ingredient detected: ${blocked} (found: ${ingredient})`);
+        }
+      }
+    }
+  }
+
+  // Check blocked tags
+  if (constraints.blocked_tags.length > 0 && recipe.tags) {
+    const tags = recipe.tags.map(tag => tag.toLowerCase());
+    for (const blocked of constraints.blocked_tags) {
+      if (tags.includes(blocked.toLowerCase())) {
+        violations.push(`Blocked tag detected: ${blocked}`);
+      }
+    }
+  }
+
+  // Check dietary tags also for blocked items
+  if (constraints.blocked_tags.length > 0 && recipe.dietary_tags) {
+    const dietaryTags = recipe.dietary_tags.map(tag => tag.toLowerCase());
+    for (const blocked of constraints.blocked_tags) {
+      if (dietaryTags.includes(blocked.toLowerCase())) {
+        violations.push(`Blocked dietary tag detected: ${blocked}`);
+      }
+    }
+  }
+
+  // Check required dietary tags
+  if (constraints.required_dietary.length > 0) {
+    const dietaryTags = (recipe.dietary_tags ?? []).map(tag => tag.toLowerCase());
+    for (const required of constraints.required_dietary) {
+      if (!dietaryTags.includes(required.toLowerCase())) {
+        violations.push(`Required dietary tag missing: ${required}`);
+      }
+    }
+  }
+
+  // Check time constraints
+  if (constraints.max_prep_min && recipe.prep_min && recipe.prep_min > constraints.max_prep_min) {
+    violations.push(`Prep time ${recipe.prep_min}min exceeds maximum ${constraints.max_prep_min}min`);
+  }
+
+  if (constraints.max_cook_min && recipe.cook_min && recipe.cook_min > constraints.max_cook_min) {
+    violations.push(`Cook time ${recipe.cook_min}min exceeds maximum ${constraints.max_cook_min}min`);
+  }
+
+  return {
+    valid: violations.length === 0,
+    violations,
+  };
+};
+
 const ensureUniqueSlug = async (baseSlug: string): Promise<string> => {
   const sanitized = slugify(baseSlug);
   let candidate = sanitized;
@@ -518,13 +584,19 @@ const buildHouseholdSummary = (aggregate: HouseholdPreferenceAggregate) => {
 };
 
 const buildPromptPayload = (request: NormalizedRecipeRequest) => {
+  const { constraints } = request;
   return {
     title: request.title,
-    description: request.description,
     meal_type: request.meal_type,
     servings: request.servings,
-    dietary_tags: request.dietary_tags,
     cuisine: request.cuisine,
+    constraints: {
+      required_dietary: constraints.required_dietary,
+      blocked_ingredients: constraints.blocked_ingredients,
+      blocked_tags: constraints.blocked_tags,
+      max_prep_min: constraints.max_prep_min,
+      max_cook_min: constraints.max_cook_min,
+    },
     household_preferences: buildHouseholdSummary(request.household_preferences),
     session_preferences: request.session_preferences,
   };
@@ -538,8 +610,13 @@ const callRecipeModel = async (
 }> => {
   const systemPrompt = joinLines([
     "You are Chef Nourish, an expert recipe developer and registered dietitian.",
-    "Design recipes that respect household dietary restrictions, avoid allergens, and stay family-friendly.",
+    "Design recipes that STRICTLY respect all provided constraints:",
+    "- REQUIRED dietary tags MUST all be present in dietary_tags",
+    "- BLOCKED ingredients MUST NOT appear in any ingredient",
+    "- BLOCKED tags MUST NOT appear in tags or dietary_tags",
+    "- Respect time limits (max_prep_min, max_cook_min) if specified",
     "Always use precise measurements, sequential steps, and ingredient metadata suitable for grocery planning.",
+    "If constraints cannot be satisfied, you may still generate a recipe, but violations will be caught post-generation.",
     "Return ONLY JSON matching the provided schema. Do not include markdown or commentary.",
   ]);
 
@@ -547,7 +624,7 @@ const callRecipeModel = async (
   const schemaName = recipeSchemaFormat.name; // 'recipe_payload'
   const schemaObject = recipeSchemaFormat.schema; // your JSON Schema
   const schemaStrict = recipeSchemaFormat.strict; // true
-  const wireSchema   = sanitizeSchema(schemaObject);
+  const wireSchema = sanitizeSchema(schemaObject);
 
   logger.info("Calling OpenAI for recipe generation", {
     title: request.title,
@@ -568,19 +645,23 @@ const callRecipeModel = async (
       },
       body: JSON.stringify({
         model: openAiModel,
+        instructions: systemPrompt,
         input: [
           {
-            role: "system",
-            content: [{ type: "input_text", text: systemPrompt }],
-          },
-          {
+            type: "message",
             role: "user",
             content: [
               {
                 type: "input_text",
                 text:
                   "Generate a complete recipe for this meal request. " +
-                  "Ensure every ingredient is compatible with the preferences and allergens listed. " +
+                  "CRITICAL CONSTRAINTS:\n" +
+                  `- Required dietary tags: ${userPayload.constraints.required_dietary.join(", ") || "none"}\n` +
+                  `- Blocked ingredients: ${userPayload.constraints.blocked_ingredients.join(", ") || "none"}\n` +
+                  `- Blocked tags: ${userPayload.constraints.blocked_tags.join(", ") || "none"}\n` +
+                  (userPayload.constraints.max_prep_min ? `- Max prep time: ${userPayload.constraints.max_prep_min} minutes\n` : "") +
+                  (userPayload.constraints.max_cook_min ? `- Max cook time: ${userPayload.constraints.max_cook_min} minutes\n` : "") +
+                  "Ensure EVERY constraint is satisfied. Do NOT use blocked ingredients or tags.\n" +
                   "Respond strictly with JSON that conforms to the attached schema.\n\n" +
                   JSON.stringify(userPayload, null, 2),
               },
@@ -589,21 +670,13 @@ const callRecipeModel = async (
         ],
         text: {
           format: {
-            // ---- Flat fields (some deployments expect these) ----
             type: "json_schema",
             name: schemaName,
             schema: wireSchema,
             strict: schemaStrict,
-
-            // ---- Nested block (others expect this) ----
-            json_schema: {
-              name: schemaName,
-              schema: wireSchema,
-              strict: schemaStrict,
-            },
           },
         },
-        max_output_tokens: 1600,
+        max_output_tokens: 4096,  // Increased from 1600 to handle complex recipes
         temperature: 0.8,
       }),
       signal: controller.signal,
@@ -622,8 +695,8 @@ const callRecipeModel = async (
   if (!response.ok) {
     const message =
       typeof responseBody.error === "object" &&
-      responseBody.error &&
-      "message" in responseBody.error
+        responseBody.error &&
+        "message" in responseBody.error
         ? String((responseBody.error as Record<string, unknown>).message)
         : `OpenAI request failed with status ${response.status}`;
     throw new Error(message);
@@ -631,21 +704,43 @@ const callRecipeModel = async (
 
   let payload: AiRecipePayload | null = null;
 
+  // Try output_parsed first (Responses API structured output)
   if (isRecord(responseBody.output_parsed)) {
     payload = responseBody.output_parsed as unknown as AiRecipePayload;
-  } else if (typeof responseBody.output_text === "string") {
+    logger.info("Parsed recipe from output_parsed", {}, "[rx]");
+  }
+  // Try output_text (legacy format)
+  else if (typeof responseBody.output_text === "string") {
     try {
       payload = JSON.parse(responseBody.output_text) as AiRecipePayload;
+      logger.info("Parsed recipe from output_text", {}, "[rx]");
     } catch {
       // ignore parse errors and continue scanning content blocks
     }
   }
 
+  // Try scanning output array (Responses API message format)
   if (!payload) {
     const output = Array.isArray(responseBody.output)
       ? responseBody.output
       : [];
+
     for (const block of output) {
+      // Check if message status is incomplete (timeout/truncated)
+      if (isRecord(block) && block.status === "incomplete") {
+        logger.error(
+          "OpenAI response is incomplete (likely timeout or token limit)",
+          {
+            message_id: block.id,
+            status: block.status,
+            has_content: Array.isArray(block.content),
+          },
+          "[rx]"
+        );
+        throw new Error("OpenAI response incomplete - generation was cut off (timeout or token limit)");
+      }
+
+      // Check if block is a message with content array
       if (isRecord(block) && Array.isArray(block.content)) {
         for (const part of block.content) {
           if (
@@ -655,23 +750,82 @@ const callRecipeModel = async (
           ) {
             try {
               payload = JSON.parse(part.text) as AiRecipePayload;
+              logger.info("Parsed recipe from output[].content[].text", {}, "[rx]");
               break;
-            } catch {
+            } catch (parseError) {
+              // Log parse error for debugging
+              logger.warn(
+                "Failed to parse JSON from output_text",
+                {
+                  text_preview: part.text.slice(0, 200),
+                  error: parseError instanceof Error ? parseError.message : String(parseError),
+                },
+                "[rx]"
+              );
               /* continue scanning other parts */
             }
           }
+        }
+      }
+      // Check if block itself has text field (alternative format)
+      else if (isRecord(block) && typeof block.text === "string") {
+        try {
+          payload = JSON.parse(block.text) as AiRecipePayload;
+          logger.info("Parsed recipe from output[].text", {}, "[rx]");
+          break;
+        } catch {
+          /* continue scanning */
         }
       }
       if (payload) break;
     }
   }
 
-  if (!payload || !payload.recipe) {
+  // Validate payload structure
+  if (!payload) {
+    // Log the response structure for debugging
+    logger.error(
+      "Failed to parse recipe from OpenAI response - no payload found",
+      {
+        has_output_parsed: !!responseBody.output_parsed,
+        has_output_text: !!responseBody.output_text,
+        has_output: !!responseBody.output,
+        output_length: Array.isArray(responseBody.output) ? responseBody.output.length : 0,
+        response_keys: Object.keys(responseBody),
+        first_output_item: Array.isArray(responseBody.output) && responseBody.output.length > 0
+          ? JSON.stringify(responseBody.output[0]).slice(0, 300)
+          : null,
+      },
+      "[rx]"
+    );
+    throw new Error("OpenAI response did not include structured recipe data");
+  }
+
+  // Check if payload has recipe field, or if payload itself is the recipe
+  let recipeData = payload.recipe;
+  if (!recipeData && isRecord(payload)) {
+    // Maybe the payload itself is the recipe (no wrapper)
+    // Check if it has recipe-like fields
+    if (payload.title || payload.ingredients || payload.steps) {
+      logger.info("Payload is the recipe itself (no wrapper)", {}, "[rx]");
+      recipeData = payload as unknown as AiRecipePayload["recipe"];
+    }
+  }
+
+  if (!recipeData) {
+    logger.error(
+      "Failed to parse recipe from OpenAI response - payload has no recipe field",
+      {
+        payload_keys: Object.keys(payload),
+        payload_preview: JSON.stringify(payload).slice(0, 300),
+      },
+      "[rx]"
+    );
     throw new Error("OpenAI response did not include structured recipe data");
   }
 
   return {
-    recipe: payload.recipe,
+    recipe: recipeData,
     raw: responseBody,
   };
 };
@@ -739,7 +893,7 @@ const normalizeIngredient = (
         : null,
     preparation:
       typeof ingredient.preparation === "string" &&
-      ingredient.preparation.trim()
+        ingredient.preparation.trim()
         ? ingredient.preparation.trim()
         : null,
     notes:
@@ -768,7 +922,7 @@ const buildPersistableRecipe = async (
   const uniqueSlug = await ensureUniqueSlug(slugInput);
 
   const dietaryTags = normalizeLowercaseArray([
-    ...request.dietary_tags,
+    ...request.constraints.required_dietary,
     ...(Array.isArray(aiRecipe.dietary_tags) ? aiRecipe.dietary_tags : []),
   ]);
 
@@ -823,6 +977,14 @@ const buildPersistableRecipe = async (
     generated_by: "recipes-ai",
     model: openAiModel,
     requested_meal_type: request.meal_type,
+    idempotency_key: request.idempotency_key,
+    job_id: request.job_id,
+    constraints: request.constraints,
+    provenance: {
+      model: openAiModel,
+      temperature: 0.8,
+      generated_at: new Date().toISOString(),
+    },
   };
 
   if (perServingBlock) {
@@ -840,52 +1002,52 @@ const buildPersistableRecipe = async (
 
   const nutrition = nutritionBlock
     ? {
-        calories_kcal:
-          typeof nutritionBlock.calories_kcal === "number" &&
+      calories_kcal:
+        typeof nutritionBlock.calories_kcal === "number" &&
           nutritionBlock.calories_kcal >= 0
-            ? Math.round(nutritionBlock.calories_kcal)
-            : null,
-        protein_g:
-          typeof nutritionBlock.protein_g === "number" &&
+          ? Math.round(nutritionBlock.calories_kcal)
+          : null,
+      protein_g:
+        typeof nutritionBlock.protein_g === "number" &&
           nutritionBlock.protein_g >= 0
-            ? Number(nutritionBlock.protein_g)
-            : null,
-        carbs_g:
-          typeof nutritionBlock.carbs_g === "number" &&
+          ? Number(nutritionBlock.protein_g)
+          : null,
+      carbs_g:
+        typeof nutritionBlock.carbs_g === "number" &&
           nutritionBlock.carbs_g >= 0
-            ? Number(nutritionBlock.carbs_g)
-            : null,
-        fat_g:
-          typeof nutritionBlock.fat_g === "number" && nutritionBlock.fat_g >= 0
-            ? Number(nutritionBlock.fat_g)
-            : null,
-        fiber_g:
-          typeof nutritionBlock.fiber_g === "number" &&
+          ? Number(nutritionBlock.carbs_g)
+          : null,
+      fat_g:
+        typeof nutritionBlock.fat_g === "number" && nutritionBlock.fat_g >= 0
+          ? Number(nutritionBlock.fat_g)
+          : null,
+      fiber_g:
+        typeof nutritionBlock.fiber_g === "number" &&
           nutritionBlock.fiber_g >= 0
-            ? Number(nutritionBlock.fiber_g)
-            : null,
-        sugar_g:
-          typeof nutritionBlock.sugar_g === "number" &&
+          ? Number(nutritionBlock.fiber_g)
+          : null,
+      sugar_g:
+        typeof nutritionBlock.sugar_g === "number" &&
           nutritionBlock.sugar_g >= 0
-            ? Number(nutritionBlock.sugar_g)
-            : null,
-        sodium_mg:
-          typeof nutritionBlock.sodium_mg === "number" &&
+          ? Number(nutritionBlock.sugar_g)
+          : null,
+      sodium_mg:
+        typeof nutritionBlock.sodium_mg === "number" &&
           nutritionBlock.sodium_mg >= 0
-            ? Math.round(nutritionBlock.sodium_mg)
-            : null,
-        meta: mergeMeta(nutritionMeta, nutritionBlock.meta),
-      }
+          ? Math.round(nutritionBlock.sodium_mg)
+          : null,
+      meta: mergeMeta(nutritionMeta, nutritionBlock.meta),
+    }
     : {
-        calories_kcal: null,
-        protein_g: null,
-        carbs_g: null,
-        fat_g: null,
-        fiber_g: null,
-        sugar_g: null,
-        sodium_mg: null,
-        meta: nutritionMeta,
-      };
+      calories_kcal: null,
+      protein_g: null,
+      carbs_g: null,
+      fat_g: null,
+      fiber_g: null,
+      sugar_g: null,
+      sodium_mg: null,
+      meta: nutritionMeta,
+    };
 
   return {
     base: {
@@ -896,10 +1058,10 @@ const buildPersistableRecipe = async (
       summary:
         typeof aiRecipe.summary === "string" && aiRecipe.summary.trim()
           ? aiRecipe.summary.trim()
-          : request.description || null,
+          : null,
       instructions:
         typeof aiRecipe.instructions === "string" &&
-        aiRecipe.instructions.trim()
+          aiRecipe.instructions.trim()
           ? aiRecipe.instructions.trim()
           : null,
       image_url:
@@ -1058,37 +1220,125 @@ Deno.serve(async (req: Request) => {
     );
   }
 
+  const startTime = Date.now();
+  let normalizedRequest: NormalizedRecipeRequest | null = null;
+
   try {
-    const normalizedRequest = await parseRequest(payload);
-    const { recipe: aiRecipe } = await callRecipeModel(normalizedRequest);
+    normalizedRequest = await parseRequest(payload);
+
+    logger.info("Starting recipe generation", {
+      stage: "recipes_ai.generate",
+      job_id: normalizedRequest.job_id,
+      idempotency_key: normalizedRequest.idempotency_key,
+      title: normalizedRequest.title,
+      meal_type: normalizedRequest.meal_type,
+      household_id: normalizedRequest.household_id,
+      dry_run: normalizedRequest.dry_run,
+    });
+
+    // Check idempotency
+    const existingRecipe = await checkIdempotency(
+      normalizedRequest.idempotency_key,
+      normalizedRequest.household_id
+    );
+    if (existingRecipe) {
+      logger.info("Idempotent duplicate detected", {
+        stage: "recipes_ai.idempotency_check",
+        job_id: normalizedRequest.job_id,
+        idempotency_key: normalizedRequest.idempotency_key,
+        recipe_id: existingRecipe.recipe_id,
+      });
+      return createJsonResponse(
+        {
+          success: true,
+          recipe_id: existingRecipe.recipe_id,
+          slug: existingRecipe.slug,
+          title: existingRecipe.title,
+          idempotent: true,
+        },
+        200
+      );
+    }
+
+    // Generate recipe using AI
+    const aiStartTime = Date.now();
+    const { recipe: aiRecipe, raw: rawResponse } = await callRecipeModel(normalizedRequest);
+    const aiLatency = Date.now() - aiStartTime;
+
+    logger.info("AI generation completed", {
+      stage: "recipes_ai.ai_complete",
+      job_id: normalizedRequest.job_id,
+      idempotency_key: normalizedRequest.idempotency_key,
+      latency_ms: aiLatency,
+    });
+
+    // Validate constraints
+    const validation = validateConstraints(aiRecipe, normalizedRequest.constraints);
+    if (!validation.valid) {
+      logger.warn("Constraint validation failed", {
+        stage: "recipes_ai.constraint_violation",
+        job_id: normalizedRequest.job_id,
+        idempotency_key: normalizedRequest.idempotency_key,
+        violations: validation.violations,
+      });
+      return createJsonResponse(
+        {
+          success: false,
+          error: "Recipe violates constraints",
+          error_type: "CONSTRAINT_VIOLATION",
+          violations: validation.violations,
+        } as RecipeError,
+        400
+      );
+    }
+
+    // Build persistable recipe
     const persistable = await buildPersistableRecipe(
       normalizedRequest,
       aiRecipe
     );
-    const { recipeId } = await persistRecipe(persistable);
 
-    logger.info("Recipe persisted", {
+    // Dry run mode - return without persisting
+    if (normalizedRequest.dry_run) {
+      logger.info("Dry run mode - returning without persisting", {
+        stage: "recipes_ai.dry_run",
+        job_id: normalizedRequest.job_id,
+        idempotency_key: normalizedRequest.idempotency_key,
+      });
+      return createJsonResponse(
+        {
+          success: true,
+          dry_run: true,
+          recipe: persistable,
+          provenance: {
+            model: openAiModel,
+            temperature: 0.8,
+            prompt_hash: crypto.randomUUID(), // Placeholder for actual hash
+          },
+        },
+        200
+      );
+    }
+
+    // Persist recipe
+    const persistStartTime = Date.now();
+    const { recipeId } = await persistRecipe(persistable);
+    const persistLatency = Date.now() - persistStartTime;
+    const totalLatency = Date.now() - startTime;
+
+    logger.info("Recipe persisted successfully", {
+      stage: "recipes_ai.complete",
+      job_id: normalizedRequest.job_id,
+      idempotency_key: normalizedRequest.idempotency_key,
       recipe_id: recipeId,
       slug: persistable.base.slug,
       created_by: persistable.base.created_by,
+      metrics: {
+        total_latency_ms: totalLatency,
+        ai_latency_ms: aiLatency,
+        persist_latency_ms: persistLatency,
+      },
     });
-
-
-    if (normalizedRequest.draft_id) {
-      callbackAssigner(
-        recipeId,
-        normalizedRequest.draft_id,
-        normalizedRequest.draft_item_index ?? null,
-      ).catch((callbackError) => {
-        logger.warn('Callback failed but recipe was created', {
-          recipe_id: recipeId,
-          error:
-            callbackError instanceof Error
-              ? callbackError.message
-              : String(callbackError),
-        });
-      });
-    }
 
     return createJsonResponse(
       {
@@ -1100,18 +1350,56 @@ Deno.serve(async (req: Request) => {
       200
     );
   } catch (error) {
-    const message =
-      error instanceof ValidationError
-        ? error.message
-        : error instanceof Error
-        ? error.message
-        : "Unexpected error";
-    const status = error instanceof ValidationError ? error.status : 500;
+    const totalLatency = Date.now() - startTime;
+
+    // Determine error type
+    let errorType: RecipeErrorType = "VALIDATION_ERROR";
+    let message = "Unexpected error";
+    let status = 500;
+
+    if (error instanceof ValidationError) {
+      errorType = "VALIDATION_ERROR";
+      message = error.message;
+      status = error.status;
+    } else if (error instanceof Error) {
+      message = error.message;
+
+      // Categorize by message content
+      if (message.includes("timeout") || message.includes("timed out")) {
+        errorType = "PROVIDER_TIMEOUT";
+        status = 504;
+      } else if (message.includes("OpenAI") || message.includes("API")) {
+        errorType = "PROVIDER_ERROR";
+        status = 502;
+      } else if (message.includes("schema") || message.includes("structured")) {
+        errorType = "SCHEMA_VALIDATION_ERROR";
+        status = 422;
+      } else if (message.includes("database") || message.includes("persist")) {
+        errorType = "DB_PERSIST_ERROR";
+        status = 500;
+      }
+    }
+
     logger.error("Recipe generation failed", {
+      stage: "recipes_ai.error",
+      job_id: normalizedRequest?.job_id,
+      idempotency_key: normalizedRequest?.idempotency_key,
+      error_type: errorType,
       message,
       error: error instanceof Error ? error.stack : error,
+      metrics: {
+        total_latency_ms: totalLatency,
+      },
     });
-    return createErrorResponse(message, status);
+
+    return createJsonResponse(
+      {
+        success: false,
+        error: message,
+        error_type: errorType,
+      } as RecipeError,
+      status
+    );
   }
 });
 

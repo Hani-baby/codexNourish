@@ -1,0 +1,16 @@
+*** Begin Patch
+*** Update File: dashboard/supabase/functions/generate-recipe-image/index.ts
+@@
+-  const recipeRow = ensureNoError(recipe, recipeError, "Failed to load recipe");
+-  if (!recipeRow) throw new HttpError(404, "Recipe not found");
+-  if (recipeRow.created_by !== user.id) {
++  const recipeRow = ensureNoError(recipe, recipeError, "Failed to load recipe");
++  if (!recipeRow) {
++    logWarn("generate-recipe-image:recipe-missing", {
++      traceId,
++      recipeId: payload.recipeId,
++    });
++    throw new HttpError(404, "Recipe not found");
++  }
++  if (recipeRow.created_by !== user.id) {
+*** End Patch
